@@ -9,6 +9,7 @@ Usage:
 import argparse
 import timeit
 import statistics
+from contextlib import nullcontext
 
 import torch
 import pandas as pd
@@ -20,7 +21,6 @@ MODEL_CONFIGS = {
     "medium": {"d_model": 1024, "d_ff": 4096,  "num_layers": 24, "num_heads": 16},
     "large":  {"d_model": 1280, "d_ff": 5120,  "num_layers": 36, "num_heads": 20},
     "xl":     {"d_model": 1600, "d_ff": 6400,  "num_layers": 48, "num_heads": 25},
-    "2.7B":   {"d_model": 2560, "d_ff": 10240, "num_layers": 32, "num_heads": 32},
 }
 
 VOCAB_SIZE = 10000
@@ -34,6 +34,7 @@ def benchmark_config(
     warmup_steps: int,
     num_steps: int,
     device: torch.device,
+    use_amp: bool = False,
 ) -> dict:
     """Benchmark a single model configuration, returns timing results."""
     model = BasicsTransformerLM(
@@ -51,11 +52,14 @@ def benchmark_config(
     input_ids = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, context_length), device=device)
     targets = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, context_length), device=device)
 
+    amp_ctx = lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
+
     def forward_step():
-        logits = model(input_ids)
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, VOCAB_SIZE), targets.view(-1)
-        )
+        with amp_ctx():
+            logits = model(input_ids)
+            loss = torch.nn.functional.cross_entropy(
+                logits.view(-1, VOCAB_SIZE), targets.view(-1)
+            )
         return loss
 
     def forward_backward_step():
@@ -101,10 +105,13 @@ def main():
     parser.add_argument("--context_length", type=int, default=128)
     parser.add_argument("--warmup_steps", type=int, default=5)
     parser.add_argument("--num_steps", type=int, default=10)
+    parser.add_argument("--mixed_precision", action="store_true", help="Use BF16 mixed precision")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    precision_label = "BF16 mixed" if args.mixed_precision else "FP32"
     print(f"Device: {device}")
+    print(f"Precision: {precision_label}")
     print(f"Context length: {args.context_length}, Batch size: {BATCH_SIZE}")
     print(f"Warmup: {args.warmup_steps}, Measurement steps: {args.num_steps}")
     print()
@@ -112,9 +119,15 @@ def main():
     rows = []
     for name, config in MODEL_CONFIGS.items():
         print(f"Benchmarking {name} ...")
-        result = benchmark_config(
-            name, config, args.context_length, args.warmup_steps, args.num_steps, device
-        )
+        try:
+            result = benchmark_config(
+                name, config, args.context_length, args.warmup_steps, args.num_steps, device,
+                use_amp=args.mixed_precision,
+            )
+        except torch.cuda.OutOfMemoryError:
+            print(f"  OOM — skipping")
+            torch.cuda.empty_cache()
+            continue
         rows.append(result)
         print(
             f"  Forward: {result['forward_mean_ms']:.2f} +/- {result['forward_std_ms']:.2f} ms | "
@@ -132,7 +145,8 @@ def main():
         "both_std_ms": "Fwd+Bwd Std (ms)",
     })
 
-    print("\n" + "=" * 80)
+    print(f"\n{'=' * 80}")
+    print(f"Precision: {precision_label}")
     print(df.to_markdown(index=False, floatfmt=".2f"))
     print("=" * 80)
 
